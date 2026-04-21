@@ -1,0 +1,28 @@
+# Build artifacts
+/target
+
+# Cargo lock is committed for binaries, uncomment to ignore for libraries
+# Cargo.lock
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.claude/
+CLAUDE.md
+
+# Local design/planning scratch (not project deliverables)
+docs/
+
+# Lantern
+.lantern/
+.lantern-ignore

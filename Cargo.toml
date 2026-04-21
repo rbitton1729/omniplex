@@ -1,0 +1,32 @@
+[package]
+name = "omniplex"
+version = "0.0.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+
+[[bin]]
+name = "omniplexd"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+humantime-serde = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+toml = "0.8"
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+
+# TODO: Lantern integration. Currently a path dep into the local docs/ clone
+# (which is .gitignored). Long-term: workspace, submodule, or git dep.
+lantern = { path = "docs/lantern" }
+
+[dev-dependencies]
+tempfile = "3"
+
+# Mirrored from docs/lantern/Cargo.toml — patch sections only apply from the
+# root workspace manifest, so Omniplex has to carry the same pin.
+[patch.crates-io]
+sqlite-vec = { path = "docs/lantern/vendor/sqlite-vec-0.1.9" }

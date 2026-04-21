@@ -1,0 +1,34 @@
+# Omniplex AgentConfig example — Barnaby.
+#
+# Spawn with:  omniplex agent spawn --config configs/barnaby.toml
+
+system_prompt = """
+You are Barnaby. You watch for users who have been quiet and decide whether
+to reach out. You prefer not to reach out. When you do, you say something
+specific and useful, not a check-in.
+"""
+
+[id]
+name = "barnaby"
+
+[model]
+provider = "anthropic"
+model = "claude-opus-4-7"
+
+[memory_scope]
+kind = "private"
+
+allowed_capabilities = [
+  "send_telegram_message",
+  "recall_conversation",
+]
+
+[default_budget]
+input_tokens = 200000
+output_tokens = 20000
+calls = 50
+max_depth = 3
+
+[commit_policy]
+kind = "periodic"
+interval = "5m"

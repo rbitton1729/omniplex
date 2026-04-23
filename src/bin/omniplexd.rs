@@ -20,9 +20,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use omniplex::catalog::ModelCatalog;
-use omniplex::config::DaemonConfig;
+use omniplex::config::{DaemonConfig, load_agent_config};
 use omniplex::daemon::{bind_plan, prepare};
-use omniplex::executor::StubExecutor;
+use omniplex::executor::{Executor, StubExecutor, executor_for};
 use omniplex::registry::InMemoryRegistry;
 use tokio::task::JoinSet;
 
@@ -43,9 +43,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let catalog = ModelCatalog::with_builtin();
     let registry = Arc::new(InMemoryRegistry::default());
 
+    // Phase 1 daemon shares one executor across every harness, so pick it
+    // from the first agent's model. Heterogeneous-provider daemons land
+    // when per-agent executor wiring does.
+    let executor: Arc<dyn Executor> = match daemon.agent_paths.first() {
+        Some(path) => executor_for(&load_agent_config(path)?.model),
+        None => Arc::new(StubExecutor),
+    };
+
     // Validate everything (configs, models, name uniqueness) before
     // touching the filesystem or binding any socket.
-    let plan = prepare(&daemon, &catalog, registry.as_ref(), Arc::new(StubExecutor))?;
+    let plan = prepare(&daemon, &catalog, registry.as_ref(), executor)?;
     let bound = bind_plan(plan)?;
 
     let (mut set, infos) = bound.spawn_all();

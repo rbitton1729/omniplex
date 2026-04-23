@@ -18,7 +18,12 @@ use thiserror::Error;
 
 use crate::bus::PeerMessage;
 use crate::memory::MemoryService;
-use crate::types::{AgentConfig, BudgetExhausted, BudgetSnapshot, DeferCondition, Deliberation};
+use crate::ollama::OllamaChatClient;
+use crate::ollama_executor::OllamaExecutor;
+use crate::types::{
+    AgentConfig, BudgetExhausted, BudgetSnapshot, DeferCondition, Deliberation, ModelProvider,
+    ModelRef,
+};
 
 #[derive(Debug, Error)]
 pub enum ExecutorError {
@@ -61,6 +66,20 @@ impl Executor for StubExecutor {
             until: DeferCondition::Never,
             reasoning: "executor not yet wired to model client".into(),
         })
+    }
+}
+
+/// Pick a concrete [`Executor`] for a given model reference.
+///
+/// Phase 1 wiring: `Ollama` returns a real `OllamaExecutor` pointed at the
+/// local daemon; everything else falls back to `StubExecutor`. The Anthropic
+/// path will land once the API client does.
+pub fn executor_for(model: &ModelRef) -> Arc<dyn Executor> {
+    match model.provider {
+        ModelProvider::Ollama => Arc::new(OllamaExecutor::new(OllamaChatClient::new(
+            "http://localhost:11434",
+        ))),
+        ModelProvider::Anthropic | ModelProvider::OpenAiCompatible => Arc::new(StubExecutor),
     }
 }
 

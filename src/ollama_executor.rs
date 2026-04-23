@@ -48,7 +48,7 @@ impl Executor for OllamaExecutor {
 
         let response = self
             .client
-            .chat(system, &user_message)
+            .chat(&ctx.config.model.model, system, &user_message)
             .await
             .map_err(map_ollama_error)?;
 
@@ -175,7 +175,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let exec = OllamaExecutor::new(OllamaChatClient::new(server.uri(), "llama3:8b"));
+        let exec = OllamaExecutor::new(OllamaChatClient::new(server.uri()));
         let got = exec
             .deliberate(message_ctx(
                 agent_config("You are Barnaby."),
@@ -202,7 +202,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let exec = OllamaExecutor::new(OllamaChatClient::new(server.uri(), "missing"));
+        let exec = OllamaExecutor::new(OllamaChatClient::new(server.uri()));
         let err = exec
             .deliberate(message_ctx(agent_config(""), "hi"))
             .await

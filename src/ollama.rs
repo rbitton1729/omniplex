@@ -54,23 +54,17 @@ struct ChatResponse {
 #[derive(Debug, Clone)]
 pub struct OllamaChatClient {
     base_url: String,
-    model: String,
     http: reqwest::Client,
 }
 
 impl OllamaChatClient {
-    pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
-        Self::with_client(base_url, model, reqwest::Client::new())
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self::with_client(base_url, reqwest::Client::new())
     }
 
-    pub fn with_client(
-        base_url: impl Into<String>,
-        model: impl Into<String>,
-        http: reqwest::Client,
-    ) -> Self {
+    pub fn with_client(base_url: impl Into<String>, http: reqwest::Client) -> Self {
         Self {
             base_url: base_url.into(),
-            model: model.into(),
             http,
         }
     }
@@ -79,15 +73,12 @@ impl OllamaChatClient {
         &self.base_url
     }
 
-    pub fn model(&self) -> &str {
-        &self.model
-    }
-
     /// POST `/api/chat` with `stream: false` and return `message.content`.
     /// `system_message` is optional; when present it is prepended as the
     /// first message with `role: system`.
     pub async fn chat(
         &self,
+        model: &str,
         system_message: Option<&str>,
         user_message: &str,
     ) -> Result<String, OllamaError> {
@@ -104,7 +95,7 @@ impl OllamaChatClient {
         });
 
         let req = ChatRequest {
-            model: &self.model,
+            model,
             messages,
             stream: false,
         };
@@ -219,8 +210,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = OllamaChatClient::new(server.uri(), "llama3:8b");
-        let out = client.chat(Some("sys"), "ping").await.unwrap();
+        let client = OllamaChatClient::new(server.uri());
+        let out = client.chat("llama3:8b", Some("sys"), "ping").await.unwrap();
         assert_eq!(out, "pong");
     }
 
@@ -245,8 +236,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = OllamaChatClient::new(server.uri(), "llama3:8b");
-        assert_eq!(client.chat(None, "hi").await.unwrap(), "yo");
+        let client = OllamaChatClient::new(server.uri());
+        assert_eq!(client.chat("llama3:8b", None, "hi").await.unwrap(), "yo");
     }
 
     #[tokio::test]
@@ -258,8 +249,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = OllamaChatClient::new(server.uri(), "missing");
-        let err = client.chat(None, "hi").await.unwrap_err();
+        let client = OllamaChatClient::new(server.uri());
+        let err = client.chat("missing", None, "hi").await.unwrap_err();
         match err {
             OllamaError::ModelNotFound(body) => assert!(body.contains("model not pulled")),
             other => panic!("expected ModelNotFound, got {other:?}"),
@@ -275,8 +266,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = OllamaChatClient::new(server.uri(), "any");
-        let err = client.chat(None, "hi").await.unwrap_err();
+        let client = OllamaChatClient::new(server.uri());
+        let err = client.chat("any", None, "hi").await.unwrap_err();
         assert!(matches!(err, OllamaError::Unauthorized(_)));
     }
 
@@ -289,8 +280,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = OllamaChatClient::new(server.uri(), "any");
-        let err = client.chat(None, "hi").await.unwrap_err();
+        let client = OllamaChatClient::new(server.uri());
+        let err = client.chat("any", None, "hi").await.unwrap_err();
         match err {
             OllamaError::Unexpected { status, body } => {
                 assert_eq!(status, 503);
@@ -307,8 +298,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let client = OllamaChatClient::new(format!("http://{addr}"), "any");
-        let err = client.chat(None, "hi").await.unwrap_err();
+        let client = OllamaChatClient::new(format!("http://{addr}"));
+        let err = client.chat("any", None, "hi").await.unwrap_err();
         assert!(matches!(err, OllamaError::Connection(_)));
     }
 }

@@ -25,6 +25,7 @@ use uuid::Uuid;
 use crate::bus::socket_path_for;
 use crate::catalog::{CatalogError, ModelCatalog};
 use crate::config::{DaemonConfig, load_agent_config};
+use crate::executor::Executor;
 use crate::harness::{AgentHarness, HarnessError};
 use crate::types::{AgentConfig, Registry, RegistryError};
 
@@ -60,11 +61,22 @@ pub struct AgentPlan {
     pub socket_path: PathBuf,
 }
 
-/// Result of [`prepare`]: validated socket directory plus per-agent plans.
+/// Result of [`prepare`]: validated socket directory, per-agent plans, and
+/// the shared executor each bound harness will dispatch through.
 #[derive(Debug, Clone)]
 pub struct DaemonPlan {
     pub socket_dir: PathBuf,
     pub agents: Vec<AgentPlan>,
+    pub executor: Arc<dyn Executor>,
+}
+
+impl DaemonPlan {
+    /// Swap the executor without re-running `prepare`. Useful in tests that
+    /// want to reuse a built plan with a different implementation.
+    pub fn with_executor(mut self, executor: Arc<dyn Executor>) -> Self {
+        self.executor = executor;
+        self
+    }
 }
 
 /// Load every agent referenced by `daemon`, validate models against
@@ -74,6 +86,7 @@ pub fn prepare(
     daemon: &DaemonConfig,
     catalog: &ModelCatalog,
     registry: &dyn Registry,
+    executor: Arc<dyn Executor>,
 ) -> Result<DaemonPlan, DaemonPrepareError> {
     let mut agents = Vec::with_capacity(daemon.agent_paths.len());
 
@@ -116,6 +129,7 @@ pub fn prepare(
     Ok(DaemonPlan {
         socket_dir: daemon.socket_dir.clone(),
         agents,
+        executor,
     })
 }
 
@@ -169,15 +183,19 @@ pub struct AgentInfo {
 /// the per-agent [`AgentHarness`]. Returns the bound harnesses so callers
 /// can either drive `spawn_all` or drop to tear everything down.
 pub fn bind_plan(plan: DaemonPlan) -> Result<BoundDaemon, DaemonBindError> {
-    std::fs::create_dir_all(&plan.socket_dir).map_err(|source| {
-        DaemonBindError::CreateSocketDir {
-            path: plan.socket_dir.clone(),
-            source,
-        }
+    let DaemonPlan {
+        socket_dir,
+        agents: plan_agents,
+        executor,
+    } = plan;
+
+    std::fs::create_dir_all(&socket_dir).map_err(|source| DaemonBindError::CreateSocketDir {
+        path: socket_dir.clone(),
+        source,
     })?;
 
-    let mut agents = Vec::with_capacity(plan.agents.len());
-    for agent in plan.agents {
+    let mut agents = Vec::with_capacity(plan_agents.len());
+    for agent in plan_agents {
         // Clear a stale socket from a prior (possibly crashed) run, else
         // UnixListener::bind would fail with AddrInUse.
         if agent.socket_path.exists() {
@@ -189,11 +207,15 @@ pub fn bind_plan(plan: DaemonPlan) -> Result<BoundDaemon, DaemonBindError> {
             })?;
         }
 
-        let harness = AgentHarness::bind((*agent.config).clone(), agent.socket_path.clone())
-            .map_err(|source| DaemonBindError::Bind {
-                path: agent.socket_path.clone(),
-                source,
-            })?;
+        let harness = AgentHarness::bind(
+            (*agent.config).clone(),
+            agent.socket_path.clone(),
+            Some(executor.clone()),
+        )
+        .map_err(|source| DaemonBindError::Bind {
+            path: agent.socket_path.clone(),
+            source,
+        })?;
 
         agents.push(BoundAgent {
             uuid: agent.uuid,
@@ -203,10 +225,7 @@ pub fn bind_plan(plan: DaemonPlan) -> Result<BoundDaemon, DaemonBindError> {
         });
     }
 
-    Ok(BoundDaemon {
-        socket_dir: plan.socket_dir,
-        agents,
-    })
+    Ok(BoundDaemon { socket_dir, agents })
 }
 
 impl BoundDaemon {
@@ -236,12 +255,18 @@ impl BoundDaemon {
 mod tests {
     use super::*;
     use crate::bus::{PeerMessage, PeerReply, send_one, socket_path_for};
+    use crate::executor::StubExecutor;
     use crate::registry::InMemoryRegistry;
     use crate::types::{
-        AgentConfig, AgentId, BudgetPolicy, CommitPolicy, MemoryScope, ModelProvider, ModelRef,
+        AgentConfig, AgentId, BudgetPolicy, CommitPolicy, DeferCondition, Deliberation,
+        MemoryScope, ModelProvider, ModelRef,
     };
     use std::path::Path;
     use tempfile::TempDir;
+
+    fn stub_executor() -> Arc<dyn Executor> {
+        Arc::new(StubExecutor)
+    }
 
     fn agent_config(name: &str, model: &str) -> AgentConfig {
         AgentConfig {
@@ -294,7 +319,8 @@ mod tests {
         let catalog = ModelCatalog::with_builtin();
         let registry = InMemoryRegistry::default();
 
-        let plan = prepare(&daemon, &catalog, &registry).expect("prepare succeeds");
+        let plan =
+            prepare(&daemon, &catalog, &registry, stub_executor()).expect("prepare succeeds");
 
         assert_eq!(plan.socket_dir, socket_dir);
         assert_eq!(plan.agents.len(), 2);
@@ -330,7 +356,7 @@ mod tests {
         let catalog = ModelCatalog::with_builtin();
         let registry = InMemoryRegistry::default();
 
-        let err = prepare(&daemon, &catalog, &registry).unwrap_err();
+        let err = prepare(&daemon, &catalog, &registry, stub_executor()).unwrap_err();
         assert!(
             matches!(err, DaemonPrepareError::UnknownModel { ref agent, .. } if agent == "ghost"),
             "unexpected error: {err:?}"
@@ -356,7 +382,7 @@ mod tests {
         let catalog = ModelCatalog::with_builtin();
         let registry = InMemoryRegistry::default();
 
-        let err = prepare(&daemon, &catalog, &registry).unwrap_err();
+        let err = prepare(&daemon, &catalog, &registry, stub_executor()).unwrap_err();
         assert!(
             matches!(err, DaemonPrepareError::DuplicateAgent(ref name) if name == "barnaby"),
             "unexpected error: {err:?}"
@@ -371,7 +397,7 @@ mod tests {
         let catalog = ModelCatalog::with_builtin();
         let registry = InMemoryRegistry::default();
 
-        let err = prepare(&daemon, &catalog, &registry).unwrap_err();
+        let err = prepare(&daemon, &catalog, &registry, stub_executor()).unwrap_err();
         assert!(
             matches!(err, DaemonPrepareError::AgentConfig { ref path, .. } if path == &missing),
             "unexpected error: {err:?}"
@@ -391,7 +417,8 @@ mod tests {
         let daemon = daemon_with_agents(socket_dir, vec![agent_file]);
         let catalog = ModelCatalog::with_builtin();
         let registry = InMemoryRegistry::default();
-        let plan = prepare(&daemon, &catalog, &registry).expect("prepare succeeds");
+        let plan =
+            prepare(&daemon, &catalog, &registry, stub_executor()).expect("prepare succeeds");
         (plan, registry)
     }
 
@@ -455,6 +482,36 @@ mod tests {
             .await
             .expect("harness answers after stale file was cleared");
         assert!(matches!(reply, PeerReply::Ack));
+        set.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bind_plan_dispatches_message_through_stub_executor() {
+        let tmp = TempDir::new().unwrap();
+        let socket_dir = tmp.path().join("sockets");
+        let (plan, _registry) = plan_with_one_agent(&tmp, socket_dir.clone(), "barnaby");
+        let bound = bind_plan(plan).expect("bind_plan succeeds");
+
+        let (mut set, _) = bound.spawn_all();
+
+        let msg = PeerMessage::Message {
+            from: crate::bus::PeerOrigin::External {
+                label: "test".into(),
+            },
+            text: "hi".into(),
+            sent_at: chrono::Utc::now(),
+        };
+        let reply = send_one(&socket_dir, "barnaby", &msg)
+            .await
+            .expect("message reaches harness");
+        match reply {
+            PeerReply::Deliberation(Deliberation::Defer { until, reasoning }) => {
+                assert!(matches!(until, DeferCondition::Never));
+                assert_eq!(reasoning, "executor not yet wired to model client");
+            }
+            other => panic!("expected stub Defer, got {other:?}"),
+        }
+
         set.shutdown().await;
     }
 

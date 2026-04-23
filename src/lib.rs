@@ -2,6 +2,7 @@ pub mod bus;
 pub mod catalog;
 pub mod config;
 pub mod daemon;
+pub mod executor;
 pub mod harness;
 pub mod memory;
 pub mod registry;

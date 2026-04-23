@@ -22,6 +22,7 @@ use std::sync::Arc;
 use omniplex::catalog::ModelCatalog;
 use omniplex::config::DaemonConfig;
 use omniplex::daemon::{bind_plan, prepare};
+use omniplex::executor::StubExecutor;
 use omniplex::registry::InMemoryRegistry;
 use tokio::task::JoinSet;
 
@@ -44,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Validate everything (configs, models, name uniqueness) before
     // touching the filesystem or binding any socket.
-    let plan = prepare(&daemon, &catalog, registry.as_ref())?;
+    let plan = prepare(&daemon, &catalog, registry.as_ref(), Arc::new(StubExecutor))?;
     let bound = bind_plan(plan)?;
 
     let (mut set, infos) = bound.spawn_all();

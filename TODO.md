@@ -3,6 +3,7 @@
 ## Phase 0: Foundation (IN PROGRESS)
 
 - [x] Core types (`Budget`, `Reservation`, `AgentId`, `AgentConfig`, `Deliberation`, `Capability`)
+- [x] In-memory `Registry` implementation with stable UUIDv5 identity + rename aliases
 - [x] ModelCatalog with builtin pricing
 - [x] Lantern-backed MemoryService actor
 - [x] Inter-agent Unix socket bus (`bus.rs`)

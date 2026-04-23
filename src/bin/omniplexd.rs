@@ -19,10 +19,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use omniplex::bus::socket_path_for;
 use omniplex::catalog::ModelCatalog;
-use omniplex::config::{DaemonConfig, load_agent_config};
+use omniplex::config::DaemonConfig;
+use omniplex::daemon::prepare;
 use omniplex::harness::AgentHarness;
+use omniplex::registry::InMemoryRegistry;
 use tokio::task::JoinSet;
 
 fn usage() -> ! {
@@ -39,24 +40,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let daemon = DaemonConfig::load_from_file(&config_path)?;
-    std::fs::create_dir_all(&daemon.socket_dir)?;
+    let catalog = ModelCatalog::with_builtin();
+    let registry = Arc::new(InMemoryRegistry::default());
 
-    let catalog = Arc::new(ModelCatalog::with_builtin());
+    // Validate everything (configs, models, name uniqueness) before
+    // touching the filesystem or binding any socket.
+    let plan = prepare(&daemon, &catalog, registry.as_ref())?;
+
+    std::fs::create_dir_all(&plan.socket_dir)?;
 
     let mut set: JoinSet<()> = JoinSet::new();
-    for agent_path in &daemon.agent_paths {
-        let cfg = load_agent_config(agent_path)?;
-
-        // Fail fast on unknown models rather than after spawn.
-        catalog.lookup(&cfg.model)?;
-
-        let socket_path = socket_path_for(&daemon.socket_dir, &cfg.id.name);
+    for agent in plan.agents {
         // Clear a stale socket from a prior (possibly crashed) run.
-        if socket_path.exists() {
-            std::fs::remove_file(&socket_path)?;
+        if agent.socket_path.exists() {
+            std::fs::remove_file(&agent.socket_path)?;
         }
 
-        let harness = AgentHarness::bind(cfg, socket_path)?;
+        let harness = AgentHarness::bind((*agent.config).clone(), agent.socket_path)?;
         eprintln!(
             "omniplexd: spawned {} at {}",
             harness.agent_name(),

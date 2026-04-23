@@ -233,6 +233,9 @@ dependencies = [
 [[package]]
 name = "lantern"
 version = "0.0.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "leb128fmt"

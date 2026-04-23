@@ -5,8 +5,9 @@ edition = "2021"
 publish = false
 
 # Minimal surface stub so Omniplex compiles before the real lantern crate
-# lands in-tree. All operations return empty/error values at runtime.
+# lands in-tree. Includes a tiny in-process JSONL store for tests.
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
+serde_json = "1"

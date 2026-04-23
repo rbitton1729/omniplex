@@ -133,18 +133,11 @@ pub enum EventPayload {
         pipeline_url: String,
     },
     /// File changed on disk (inotify).
-    FileChanged {
-        path: String,
-        event: FileEventKind,
-    },
+    FileChanged { path: String, event: FileEventKind },
     /// POSIX signal delivered to the process (phase 2).
-    Signal {
-        signal: String,
-    },
+    Signal { signal: String },
     /// Generic catch-all for Phase 1 until we have strongly-typed variants.
-    Raw {
-        json: serde_json::Value,
-    },
+    Raw { json: serde_json::Value },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

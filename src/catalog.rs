@@ -90,12 +90,20 @@ impl ModelCatalog {
         c.insert(
             ModelProvider::Ollama,
             "qwen3:32b",
-            ModelEntry { max_context: 32_768, cost_per_input_token: 0.0, cost_per_output_token: 0.0 },
+            ModelEntry {
+                max_context: 32_768,
+                cost_per_input_token: 0.0,
+                cost_per_output_token: 0.0,
+            },
         );
         c.insert(
             ModelProvider::Ollama,
             "nomic-embed-text",
-            ModelEntry { max_context: 8_192, cost_per_input_token: 0.0, cost_per_output_token: 0.0 },
+            ModelEntry {
+                max_context: 8_192,
+                cost_per_input_token: 0.0,
+                cost_per_output_token: 0.0,
+            },
         );
 
         c

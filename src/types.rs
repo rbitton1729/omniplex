@@ -46,7 +46,11 @@ pub struct Allocation {
 
 impl Allocation {
     pub const fn zero() -> Self {
-        Self { input_tokens: 0, output_tokens: 0, calls: 0 }
+        Self {
+            input_tokens: 0,
+            output_tokens: 0,
+            calls: 0,
+        }
     }
 }
 
@@ -176,7 +180,11 @@ impl Reservation {
         if calls > self.reserved.calls {
             return Err(BudgetExhausted::Calls);
         }
-        self.spent = Allocation { input_tokens: input, output_tokens: output, calls };
+        self.spent = Allocation {
+            input_tokens: input,
+            output_tokens: output,
+            calls,
+        };
         Ok(())
     }
 
@@ -188,15 +196,25 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         let unused = Allocation {
-            input_tokens: self.reserved.input_tokens.saturating_sub(self.spent.input_tokens),
-            output_tokens: self.reserved.output_tokens.saturating_sub(self.spent.output_tokens),
+            input_tokens: self
+                .reserved
+                .input_tokens
+                .saturating_sub(self.spent.input_tokens),
+            output_tokens: self
+                .reserved
+                .output_tokens
+                .saturating_sub(self.spent.output_tokens),
             calls: self.reserved.calls.saturating_sub(self.spent.calls),
         };
         if let Ok(mut cell) = self.cell.lock() {
-            cell.remaining.input_tokens =
-                cell.remaining.input_tokens.saturating_add(unused.input_tokens);
-            cell.remaining.output_tokens =
-                cell.remaining.output_tokens.saturating_add(unused.output_tokens);
+            cell.remaining.input_tokens = cell
+                .remaining
+                .input_tokens
+                .saturating_add(unused.input_tokens);
+            cell.remaining.output_tokens = cell
+                .remaining
+                .output_tokens
+                .saturating_add(unused.output_tokens);
             cell.remaining.calls = cell.remaining.calls.saturating_add(unused.calls);
         }
     }
@@ -319,7 +337,9 @@ pub enum ModelProvider {
 pub enum MemoryScope {
     #[default]
     Private,
-    Shared { with: Vec<AgentId> },
+    Shared {
+        with: Vec<AgentId>,
+    },
     Global,
 }
 
@@ -410,11 +430,25 @@ pub struct Goal {
 /// with their phases (UserQuiet/Memory in Phase 2, Ci in Phase 1).
 #[derive(Debug, Clone)]
 pub enum Watch {
-    Pattern { pattern: EventPattern, threshold: usize, window: Duration },
-    UserQuiet { user: UserId, duration: Duration },
-    Ci { project: String, expected: CiStatus },
-    Memory { query: String },
-    Once { payload: serde_json::Value },
+    Pattern {
+        pattern: EventPattern,
+        threshold: usize,
+        window: Duration,
+    },
+    UserQuiet {
+        user: UserId,
+        duration: Duration,
+    },
+    Ci {
+        project: String,
+        expected: CiStatus,
+    },
+    Memory {
+        query: String,
+    },
+    Once {
+        payload: serde_json::Value,
+    },
 }
 
 // Placeholder shapes. The proper types land with the first watch impl;
@@ -492,7 +526,11 @@ mod tests {
     }
 
     fn alloc(input: u64, output: u64, calls: u32) -> Allocation {
-        Allocation { input_tokens: input, output_tokens: output, calls }
+        Allocation {
+            input_tokens: input,
+            output_tokens: output,
+            calls,
+        }
     }
 
     #[test]
@@ -501,7 +539,11 @@ mod tests {
 
         {
             let mut r = budget.reserve(alloc(500, 500, 5)).unwrap();
-            r.charge(ModelUsage { input_tokens: 100, output_tokens: 50 }).unwrap();
+            r.charge(ModelUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+            })
+            .unwrap();
             // Drop happens here; unspent 400/450/4 returns.
         }
 
@@ -513,10 +555,17 @@ mod tests {
     fn charge_beyond_reservation_errors_and_leaves_state() {
         let budget = Budget::new(origin(), Uuid::new_v4(), alloc(1000, 1000, 10), 3);
         let mut r = budget.reserve(alloc(100, 100, 2)).unwrap();
-        r.charge(ModelUsage { input_tokens: 80, output_tokens: 80 }).unwrap();
+        r.charge(ModelUsage {
+            input_tokens: 80,
+            output_tokens: 80,
+        })
+        .unwrap();
 
         let err = r
-            .charge(ModelUsage { input_tokens: 50, output_tokens: 10 })
+            .charge(ModelUsage {
+                input_tokens: 50,
+                output_tokens: 10,
+            })
             .unwrap_err();
         assert!(matches!(err, BudgetExhausted::InputTokens));
         // Prior charge stands.
@@ -567,7 +616,9 @@ mod tests {
                 calls: 50,
                 max_depth: 3,
             },
-            commit_policy: CommitPolicy::Periodic { interval: Duration::from_secs(300) },
+            commit_policy: CommitPolicy::Periodic {
+                interval: Duration::from_secs(300),
+            },
         };
 
         let s = toml::to_string(&cfg).unwrap();

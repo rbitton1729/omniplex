@@ -16,36 +16,18 @@
 //! agents = ["configs/barnaby.toml", "configs/diogenes.toml"]
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use omniplex::bus::socket_path_for;
 use omniplex::catalog::ModelCatalog;
+use omniplex::config::{DaemonConfig, load_agent_config};
 use omniplex::harness::AgentHarness;
-use omniplex::types::AgentConfig;
-use serde::Deserialize;
 use tokio::task::JoinSet;
-
-#[derive(Debug, Deserialize)]
-struct DaemonConfig {
-    socket_dir: PathBuf,
-    #[serde(default)]
-    agents: Vec<PathBuf>,
-}
 
 fn usage() -> ! {
     eprintln!("usage: omniplexd <daemon-config.toml>");
     std::process::exit(2);
-}
-
-fn load_daemon_config(path: &Path) -> Result<DaemonConfig, Box<dyn std::error::Error>> {
-    let raw = std::fs::read_to_string(path)?;
-    Ok(toml::from_str(&raw)?)
-}
-
-fn load_agent_config(path: &Path) -> Result<AgentConfig, Box<dyn std::error::Error>> {
-    let raw = std::fs::read_to_string(path)?;
-    Ok(toml::from_str(&raw)?)
 }
 
 #[tokio::main]
@@ -56,13 +38,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => usage(),
     };
 
-    let daemon = load_daemon_config(&config_path)?;
+    let daemon = DaemonConfig::load_from_file(&config_path)?;
     std::fs::create_dir_all(&daemon.socket_dir)?;
 
     let catalog = Arc::new(ModelCatalog::with_builtin());
 
     let mut set: JoinSet<()> = JoinSet::new();
-    for agent_path in &daemon.agents {
+    for agent_path in &daemon.agent_paths {
         let cfg = load_agent_config(agent_path)?;
 
         // Fail fast on unknown models rather than after spawn.

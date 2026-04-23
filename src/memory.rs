@@ -95,7 +95,10 @@ pub struct SearchOpts {
 
 impl Default for SearchOpts {
     fn default() -> Self {
-        Self { mode: SearchMode::Keyword, limit: 10 }
+        Self {
+            mode: SearchMode::Keyword,
+            limit: 10,
+        }
     }
 }
 
@@ -232,7 +235,12 @@ fn actor_loop(mut store: lantern::store::Store, mut rx: mpsc::Receiver<Op>) {
             Op::Record { uri, jsonl, reply } => {
                 let _ = reply.send(do_record(&mut store, &uri, &jsonl));
             }
-            Op::Search { prefix, query, opts, reply } => {
+            Op::Search {
+                prefix,
+                query,
+                opts,
+                reply,
+            } => {
                 let _ = reply.send(do_search(&store, &prefix, &query, opts));
             }
         }
@@ -272,10 +280,14 @@ fn do_search(
     match opts.mode {
         SearchMode::Keyword => {}
         SearchMode::Semantic => {
-            return Err(MemoryError::NotImplemented("semantic search (Ollama embeddings)"));
+            return Err(MemoryError::NotImplemented(
+                "semantic search (Ollama embeddings)",
+            ));
         }
         SearchMode::Hybrid => {
-            return Err(MemoryError::NotImplemented("hybrid search (requires embeddings)"));
+            return Err(MemoryError::NotImplemented(
+                "hybrid search (requires embeddings)",
+            ));
         }
     }
 
@@ -366,7 +378,10 @@ mod tests {
         let barnaby = AgentId::new("barnaby");
 
         let t = turn(vec![
-            entry("deliberation", "Three CI failures on pipeline seven in the last hour."),
+            entry(
+                "deliberation",
+                "Three CI failures on pipeline seven in the last hour.",
+            ),
             entry("task_intent", "Escalate to oncall for pipeline seven."),
         ]);
         mem.record_turn(&barnaby, t).await.unwrap();
@@ -377,10 +392,16 @@ mod tests {
             .await
             .unwrap();
         assert!(!hits.is_empty(), "expected at least one hit");
-        assert!(hits.iter().any(|h| h.text.to_lowercase().contains("escalate")));
+        assert!(
+            hits.iter()
+                .any(|h| h.text.to_lowercase().contains("escalate"))
+        );
         assert!(hits[0].uri.starts_with("agent://barnaby/goal/"));
         // jsonl extractor prefixes with role — confirm metadata round-tripped.
-        assert!(hits.iter().any(|h| h.role.as_deref() == Some("task_intent")));
+        assert!(
+            hits.iter()
+                .any(|h| h.role.as_deref() == Some("task_intent"))
+        );
     }
 
     #[tokio::test]
@@ -401,7 +422,10 @@ mod tests {
             .await
             .unwrap();
 
-        let opts = SearchOpts { mode: SearchMode::Semantic, limit: 10 };
+        let opts = SearchOpts {
+            mode: SearchMode::Semantic,
+            limit: 10,
+        };
         let err = mem.search(&barnaby, "anything", opts).await.unwrap_err();
         assert!(matches!(err, MemoryError::NotImplemented(_)));
     }

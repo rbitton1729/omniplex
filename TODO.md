@@ -10,10 +10,10 @@
   - One-shot request/response over `UnixStream`
   - Agent discovery via well-known socket directory (`<socket_dir>/<name>.sock`)
   - Phase 2: SO_PEERCRED auth, streaming replies, broadcast
-- [ ] Omniplexd parent process (spawn agents, supervise, signal handling)
-- [ ] Agent harness (accept loop + recv_one + route to deliberation)
-- [ ] Config loader + hot reload
-- [ ] Empty `main.rs` → `omniplexd` binary entrypoint
+- [x] Omniplexd parent process (spawn agents, supervise, signal handling)
+- [x] Agent harness (accept loop + recv_one + route to deliberation)
+- [x] Config loader (daemon TOML + agent TOMLs, config-relative paths)
+- [x] Empty `main.rs` → `omniplexd` binary entrypoint
 
 ## Phase 1: Simple Agents
 
@@ -44,7 +44,4 @@
 
 ## Blockers
 
-- `docs/lantern/` path dependency missing locally.  Options:
-  1. Stub out minimal Lantern interface for harness development
-  2. Add lantern as a proper submodule / git dep / workspace member
-  3. Use feature gate to make Lantern optional in Phase 1
+- `docs/lantern/` path dependency missing locally. Current branch uses `stubs/lantern/`, a tiny in-process JSONL test double, until the real crate is vendored or moved to a proper dependency.

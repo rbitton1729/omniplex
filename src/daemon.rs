@@ -14,15 +14,18 @@
 //! On success, callers walk the returned [`DaemonPlan`] to bind sockets
 //! and spawn harnesses. On failure, no socket has been touched.
 
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use thiserror::Error;
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::bus::socket_path_for;
 use crate::catalog::{CatalogError, ModelCatalog};
 use crate::config::{DaemonConfig, load_agent_config};
+use crate::harness::{AgentHarness, HarnessError};
 use crate::types::{AgentConfig, Registry, RegistryError};
 
 #[derive(Debug, Error)]
@@ -116,9 +119,123 @@ pub fn prepare(
     })
 }
 
+#[derive(Debug, Error)]
+pub enum DaemonBindError {
+    #[error("failed to create socket dir {path}: {source}")]
+    CreateSocketDir {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to remove stale socket {path}: {source}")]
+    RemoveStaleSocket {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to bind {path}: {source}")]
+    Bind {
+        path: PathBuf,
+        #[source]
+        source: HarnessError,
+    },
+}
+
+/// One agent bound to its Unix socket and ready to serve.
+pub struct BoundAgent {
+    pub uuid: Uuid,
+    pub config: Arc<AgentConfig>,
+    pub socket_path: PathBuf,
+    harness: AgentHarness,
+}
+
+/// Result of [`bind_plan`]: socket directory created, every agent's socket
+/// bound, ready to spawn the accept loops.
+pub struct BoundDaemon {
+    pub socket_dir: PathBuf,
+    pub agents: Vec<BoundAgent>,
+}
+
+/// Read-only metadata about a running agent — what callers need to log or
+/// route to after the harness has been spawned onto a task.
+#[derive(Debug, Clone)]
+pub struct AgentInfo {
+    pub name: String,
+    pub socket_path: PathBuf,
+}
+
+/// Materialize a [`DaemonPlan`] on disk: create the socket directory,
+/// clear any stale socket file at each agent's well-known path, and bind
+/// the per-agent [`AgentHarness`]. Returns the bound harnesses so callers
+/// can either drive `spawn_all` or drop to tear everything down.
+pub fn bind_plan(plan: DaemonPlan) -> Result<BoundDaemon, DaemonBindError> {
+    std::fs::create_dir_all(&plan.socket_dir).map_err(|source| {
+        DaemonBindError::CreateSocketDir {
+            path: plan.socket_dir.clone(),
+            source,
+        }
+    })?;
+
+    let mut agents = Vec::with_capacity(plan.agents.len());
+    for agent in plan.agents {
+        // Clear a stale socket from a prior (possibly crashed) run, else
+        // UnixListener::bind would fail with AddrInUse.
+        if agent.socket_path.exists() {
+            std::fs::remove_file(&agent.socket_path).map_err(|source| {
+                DaemonBindError::RemoveStaleSocket {
+                    path: agent.socket_path.clone(),
+                    source,
+                }
+            })?;
+        }
+
+        let harness = AgentHarness::bind((*agent.config).clone(), agent.socket_path.clone())
+            .map_err(|source| DaemonBindError::Bind {
+                path: agent.socket_path.clone(),
+                source,
+            })?;
+
+        agents.push(BoundAgent {
+            uuid: agent.uuid,
+            config: agent.config,
+            socket_path: agent.socket_path,
+            harness,
+        });
+    }
+
+    Ok(BoundDaemon {
+        socket_dir: plan.socket_dir,
+        agents,
+    })
+}
+
+impl BoundDaemon {
+    /// Consume each bound agent and spawn its accept loop onto a [`JoinSet`].
+    /// Returns the join set alongside stable per-agent metadata so the caller
+    /// can log, shut down, or match replies back to agents.
+    pub fn spawn_all(self) -> (JoinSet<()>, Vec<AgentInfo>) {
+        let mut set = JoinSet::new();
+        let mut infos = Vec::with_capacity(self.agents.len());
+        for agent in self.agents {
+            infos.push(AgentInfo {
+                name: agent.config.id.name.clone(),
+                socket_path: agent.socket_path.clone(),
+            });
+            let name = agent.config.id.name.clone();
+            set.spawn(async move {
+                if let Err(e) = agent.harness.run().await {
+                    eprintln!("harness[{name}] exited with error: {e}");
+                }
+            });
+        }
+        (set, infos)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::{PeerMessage, PeerReply, send_one, socket_path_for};
     use crate::registry::InMemoryRegistry;
     use crate::types::{
         AgentConfig, AgentId, BudgetPolicy, CommitPolicy, MemoryScope, ModelProvider, ModelRef,
@@ -259,5 +376,98 @@ mod tests {
             matches!(err, DaemonPrepareError::AgentConfig { ref path, .. } if path == &missing),
             "unexpected error: {err:?}"
         );
+    }
+
+    fn plan_with_one_agent(
+        tmp: &TempDir,
+        socket_dir: PathBuf,
+        name: &str,
+    ) -> (DaemonPlan, InMemoryRegistry) {
+        let agent_file = write_agent(
+            tmp.path(),
+            &format!("{name}.toml"),
+            &agent_config(name, "claude-opus-4-7"),
+        );
+        let daemon = daemon_with_agents(socket_dir, vec![agent_file]);
+        let catalog = ModelCatalog::with_builtin();
+        let registry = InMemoryRegistry::default();
+        let plan = prepare(&daemon, &catalog, &registry).expect("prepare succeeds");
+        (plan, registry)
+    }
+
+    #[tokio::test]
+    async fn bind_plan_spawns_harness_that_answers_ping_and_status() {
+        let tmp = TempDir::new().unwrap();
+        let socket_dir = tmp.path().join("sockets");
+        let (plan, _registry) = plan_with_one_agent(&tmp, socket_dir.clone(), "barnaby");
+
+        let bound = bind_plan(plan).expect("bind_plan succeeds");
+
+        assert!(socket_dir.is_dir(), "socket_dir should be created");
+        assert_eq!(bound.socket_dir, socket_dir);
+        assert_eq!(bound.agents.len(), 1);
+        let expected_socket = socket_path_for(&socket_dir, "barnaby");
+        assert_eq!(bound.agents[0].socket_path, expected_socket);
+        assert_eq!(bound.agents[0].config.id.name, "barnaby");
+        assert!(
+            expected_socket.exists(),
+            "bind_plan should leave the socket file in place"
+        );
+
+        let (mut set, infos) = bound.spawn_all();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].name, "barnaby");
+        assert_eq!(infos[0].socket_path, expected_socket);
+
+        let ack = send_one(&socket_dir, "barnaby", &PeerMessage::Ping)
+            .await
+            .expect("ping reaches harness");
+        assert!(matches!(ack, PeerReply::Ack), "expected Ack, got {ack:?}");
+
+        let status = send_one(&socket_dir, "barnaby", &PeerMessage::Status)
+            .await
+            .expect("status reaches harness");
+        match status {
+            PeerReply::Status { agent, .. } => assert_eq!(agent.name, "barnaby"),
+            other => panic!("expected Status, got {other:?}"),
+        }
+
+        set.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bind_plan_replaces_stale_socket_file() {
+        let tmp = TempDir::new().unwrap();
+        let socket_dir = tmp.path().join("sockets");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let stale = socket_path_for(&socket_dir, "barnaby");
+        std::fs::write(&stale, b"stale leftover").unwrap();
+
+        let (plan, _registry) = plan_with_one_agent(&tmp, socket_dir.clone(), "barnaby");
+
+        let bound = bind_plan(plan).expect("bind_plan removes stale socket and binds");
+        assert_eq!(bound.agents[0].socket_path, stale);
+
+        // The listener is live now — a Ping round-trip proves the stale file
+        // was not just overwritten but replaced by a real Unix socket.
+        let (mut set, _) = bound.spawn_all();
+        let reply = send_one(&socket_dir, "barnaby", &PeerMessage::Ping)
+            .await
+            .expect("harness answers after stale file was cleared");
+        assert!(matches!(reply, PeerReply::Ack));
+        set.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bind_plan_creates_missing_socket_dir() {
+        let tmp = TempDir::new().unwrap();
+        let socket_dir = tmp.path().join("nested/sockets");
+        assert!(!socket_dir.exists());
+        let (plan, _registry) = plan_with_one_agent(&tmp, socket_dir.clone(), "barnaby");
+
+        let bound = bind_plan(plan).expect("bind_plan creates the socket dir");
+
+        assert!(socket_dir.is_dir());
+        drop(bound);
     }
 }

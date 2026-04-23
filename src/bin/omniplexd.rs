@@ -21,8 +21,7 @@ use std::sync::Arc;
 
 use omniplex::catalog::ModelCatalog;
 use omniplex::config::DaemonConfig;
-use omniplex::daemon::prepare;
-use omniplex::harness::AgentHarness;
+use omniplex::daemon::{bind_plan, prepare};
 use omniplex::registry::InMemoryRegistry;
 use tokio::task::JoinSet;
 
@@ -46,27 +45,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Validate everything (configs, models, name uniqueness) before
     // touching the filesystem or binding any socket.
     let plan = prepare(&daemon, &catalog, registry.as_ref())?;
+    let bound = bind_plan(plan)?;
 
-    std::fs::create_dir_all(&plan.socket_dir)?;
-
-    let mut set: JoinSet<()> = JoinSet::new();
-    for agent in plan.agents {
-        // Clear a stale socket from a prior (possibly crashed) run.
-        if agent.socket_path.exists() {
-            std::fs::remove_file(&agent.socket_path)?;
-        }
-
-        let harness = AgentHarness::bind((*agent.config).clone(), agent.socket_path)?;
+    let (mut set, infos) = bound.spawn_all();
+    for info in &infos {
         eprintln!(
             "omniplexd: spawned {} at {}",
-            harness.agent_name(),
-            harness.socket_path().display()
+            info.name,
+            info.socket_path.display()
         );
-        set.spawn(async move {
-            if let Err(e) = harness.run().await {
-                eprintln!("harness exited with error: {e}");
-            }
-        });
     }
 
     tokio::select! {

@@ -5,5 +5,7 @@ pub mod daemon;
 pub mod executor;
 pub mod harness;
 pub mod memory;
+pub mod ollama;
+pub mod ollama_executor;
 pub mod registry;
 pub mod types;

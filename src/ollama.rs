@@ -1,12 +1,13 @@
 //! Ollama HTTP chat client.
 //!
-//! Phase 1 scope: a single non-streaming POST to `/api/chat` that turns one
-//! optional system prompt + one user message into one assistant string.
+//! Phase 1 scope: non-streaming POST to `/api/chat`. The client accepts
+//! either a single user message (`chat`) or a full multi-turn history
+//! (`chat_messages`); both return the assistant's reply as a string.
 //! No streaming, no token accounting (Phase 2), no tool use, no embeddings.
 //!
 //! The client is intentionally narrow — keep the surface small until the
-//! executor actually needs more from it. Multi-turn conversation and
-//! per-call options (temperature, num_ctx, …) belong in a follow-up.
+//! executor actually needs more from it. Per-call options (temperature,
+//! num_ctx, …) belong in a follow-up.
 
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -27,15 +28,24 @@ pub enum OllamaError {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ChatMessage<'a> {
-    role: &'a str,
-    content: &'a str,
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+impl ChatMessage {
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ChatRequest<'a> {
-    model: &'a str,
-    messages: Vec<ChatMessage<'a>>,
+struct ChatRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
     stream: bool,
 }
 
@@ -84,27 +94,34 @@ impl OllamaChatClient {
     ) -> Result<String, OllamaError> {
         let mut messages = Vec::with_capacity(2);
         if let Some(sys) = system_message {
-            messages.push(ChatMessage {
-                role: "system",
-                content: sys,
-            });
+            messages.push(ChatMessage::new("system", sys));
         }
-        messages.push(ChatMessage {
-            role: "user",
-            content: user_message,
-        });
+        messages.push(ChatMessage::new("user", user_message));
+        self.chat_messages(model, messages).await
+    }
 
+    /// POST `/api/chat` with a caller-constructed message list.
+    /// The caller is responsible for ordering — typically
+    /// `[system?, ...history, user]`.
+    pub async fn chat_messages(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+    ) -> Result<String, OllamaError> {
         let req = ChatRequest {
-            model,
+            model: model.to_string(),
             messages,
             stream: false,
         };
+        self.post_chat(&req).await
+    }
 
+    async fn post_chat(&self, req: &ChatRequest) -> Result<String, OllamaError> {
         let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
         let resp = self
             .http
             .post(&url)
-            .json(&req)
+            .json(req)
             .send()
             .await
             .map_err(|e| OllamaError::Connection(e.to_string()))?;
@@ -165,16 +182,10 @@ mod tests {
     #[test]
     fn test_chat_request_builder() {
         let req = ChatRequest {
-            model: "llama3:8b",
+            model: "llama3:8b".into(),
             messages: vec![
-                ChatMessage {
-                    role: "system",
-                    content: "be helpful",
-                },
-                ChatMessage {
-                    role: "user",
-                    content: "hi",
-                },
+                ChatMessage::new("system", "be helpful"),
+                ChatMessage::new("user", "hi"),
             ],
             stream: false,
         };
@@ -186,6 +197,41 @@ mod tests {
         assert_eq!(v["messages"][0]["content"], "be helpful");
         assert_eq!(v["messages"][1]["role"], "user");
         assert_eq!(v["messages"][1]["content"], "hi");
+    }
+
+    #[tokio::test]
+    async fn chat_messages_sends_full_history() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_json(serde_json::json!({
+                "model": "llama3:8b",
+                "messages": [
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "reply"},
+                    {"role": "user", "content": "second"}
+                ],
+                "stream": false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "llama3:8b",
+                "created_at": "2024-01-01T00:00:00Z",
+                "message": {"role": "assistant", "content": "ok"},
+                "done": true
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OllamaChatClient::new(server.uri());
+        let msgs = vec![
+            ChatMessage::new("system", "sys"),
+            ChatMessage::new("user", "first"),
+            ChatMessage::new("assistant", "reply"),
+            ChatMessage::new("user", "second"),
+        ];
+        let out = client.chat_messages("llama3:8b", msgs).await.unwrap();
+        assert_eq!(out, "ok");
     }
 
     #[tokio::test]

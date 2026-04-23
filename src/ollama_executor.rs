@@ -8,27 +8,41 @@
 //! exactly what a human-facing `Message` flow needs (the harness returns it
 //! in `PeerReply::Deliberation`).
 //!
+//! Multi-turn history is held per-executor in an `Arc<Mutex<Vec<ChatMessage>>>`.
+//! Each `deliberate` call prepends the system prompt, appends the accumulated
+//! history, then the new user turn; on success both the user message and the
+//! assistant reply are appended to history. The mutex is held across the
+//! HTTP call, so concurrent deliberations on the same executor serialize —
+//! that matches the single accept-loop-per-agent harness model.
+//!
 //! Out of scope for Phase 1:
 //!   - Token accounting against `ctx.budget` (Phase 2 — wiring the
 //!     `prompt_eval_count` / `eval_count` fields into a Reservation).
 //!   - Memory recall (Phase 2 — `ctx.memory` is ignored).
-//!   - Conversation history beyond the single incoming message.
+//!   - History compaction / truncation (the vec grows unbounded for now).
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio::sync::Mutex;
 
 use crate::bus::{EventPayload, PeerMessage};
 use crate::executor::{ExecutionContext, Executor, ExecutorError};
-use crate::ollama::{OllamaChatClient, OllamaError};
+use crate::ollama::{ChatMessage, OllamaChatClient, OllamaError};
 use crate::types::{DeferCondition, Deliberation};
 
 #[derive(Debug, Clone)]
 pub struct OllamaExecutor {
     client: OllamaChatClient,
+    history: Arc<Mutex<Vec<ChatMessage>>>,
 }
 
 impl OllamaExecutor {
     pub fn new(client: OllamaChatClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            history: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 
     pub fn client(&self) -> &OllamaChatClient {
@@ -40,17 +54,23 @@ impl OllamaExecutor {
 impl Executor for OllamaExecutor {
     async fn deliberate(&self, ctx: ExecutionContext) -> Result<Deliberation, ExecutorError> {
         let user_message = render_user_message(&ctx.message)?;
-        let system = if ctx.config.system_prompt.is_empty() {
-            None
-        } else {
-            Some(ctx.config.system_prompt.as_str())
-        };
+
+        let mut history = self.history.lock().await;
+        let mut messages = Vec::with_capacity(history.len() + 2);
+        if !ctx.config.system_prompt.is_empty() {
+            messages.push(ChatMessage::new("system", ctx.config.system_prompt.clone()));
+        }
+        messages.extend(history.iter().cloned());
+        messages.push(ChatMessage::new("user", user_message.clone()));
 
         let response = self
             .client
-            .chat(&ctx.config.model.model, system, &user_message)
+            .chat_messages(&ctx.config.model.model, messages)
             .await
             .map_err(map_ollama_error)?;
+
+        history.push(ChatMessage::new("user", user_message));
+        history.push(ChatMessage::new("assistant", response.clone()));
 
         Ok(Deliberation::Defer {
             until: DeferCondition::Never,
@@ -112,7 +132,7 @@ fn map_ollama_error(err: OllamaError) -> ExecutorError {
 mod tests {
     use std::sync::Arc;
 
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -189,6 +209,131 @@ mod tests {
                 assert!(matches!(until, DeferCondition::Never));
                 assert_eq!(reasoning, "I am Barnaby.");
             }
+            other => panic!("expected Defer, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deliberate_accumulates_history_across_turns() {
+        let server = MockServer::start().await;
+
+        // First turn: system + user("hello").
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_json(serde_json::json!({
+                "model": "llama3:8b",
+                "messages": [
+                    {"role": "system", "content": "You are Barnaby."},
+                    {"role": "user", "content": "hello"}
+                ],
+                "stream": false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "llama3:8b",
+                "created_at": "2024-01-01T00:00:00Z",
+                "message": {"role": "assistant", "content": "hi there"},
+                "done": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Second turn: system + full prior history + new user("still there?").
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_json(serde_json::json!({
+                "model": "llama3:8b",
+                "messages": [
+                    {"role": "system", "content": "You are Barnaby."},
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hi there"},
+                    {"role": "user", "content": "still there?"}
+                ],
+                "stream": false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "llama3:8b",
+                "created_at": "2024-01-01T00:00:00Z",
+                "message": {"role": "assistant", "content": "yes"},
+                "done": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let exec = OllamaExecutor::new(OllamaChatClient::new(server.uri()));
+        let cfg = agent_config("You are Barnaby.");
+
+        let first = exec
+            .deliberate(message_ctx(cfg.clone(), "hello"))
+            .await
+            .unwrap();
+        match first {
+            Deliberation::Defer { reasoning, .. } => assert_eq!(reasoning, "hi there"),
+            other => panic!("expected Defer, got {other:?}"),
+        }
+
+        let second = exec
+            .deliberate(message_ctx(cfg, "still there?"))
+            .await
+            .unwrap();
+        match second {
+            Deliberation::Defer { reasoning, .. } => assert_eq!(reasoning, "yes"),
+            other => panic!("expected Defer, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deliberate_failed_turn_does_not_poison_history() {
+        let server = MockServer::start().await;
+
+        // First call fails with 503 — history must NOT grow.
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_json(serde_json::json!({
+                "model": "llama3:8b",
+                "messages": [
+                    {"role": "user", "content": "first"}
+                ],
+                "stream": false
+            })))
+            .respond_with(ResponseTemplate::new(503).set_body_string("overloaded"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Second call must show only the new user message, not a stale pair.
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_json(serde_json::json!({
+                "model": "llama3:8b",
+                "messages": [
+                    {"role": "user", "content": "second"}
+                ],
+                "stream": false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "llama3:8b",
+                "created_at": "2024-01-01T00:00:00Z",
+                "message": {"role": "assistant", "content": "ok"},
+                "done": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let exec = OllamaExecutor::new(OllamaChatClient::new(server.uri()));
+        let cfg = agent_config("");
+
+        let err = exec
+            .deliberate(message_ctx(cfg.clone(), "first"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ExecutorError::ModelUnavailable(_)));
+
+        let ok = exec.deliberate(message_ctx(cfg, "second")).await.unwrap();
+        match ok {
+            Deliberation::Defer { reasoning, .. } => assert_eq!(reasoning, "ok"),
             other => panic!("expected Defer, got {other:?}"),
         }
     }

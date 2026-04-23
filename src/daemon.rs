@@ -53,30 +53,22 @@ pub enum DaemonPrepareError {
 }
 
 /// One agent's prepared state: its registry-canonical config, its UUID,
-/// and the socket path it should bind.
+/// the socket path it should bind, and the executor it will dispatch
+/// through. Per-agent so a daemon can mix providers (e.g., one Ollama
+/// agent alongside one Anthropic agent).
 #[derive(Debug, Clone)]
 pub struct AgentPlan {
     pub uuid: Uuid,
     pub config: Arc<AgentConfig>,
     pub socket_path: PathBuf,
+    pub executor: Arc<dyn Executor>,
 }
 
-/// Result of [`prepare`]: validated socket directory, per-agent plans, and
-/// the shared executor each bound harness will dispatch through.
+/// Result of [`prepare`]: validated socket directory and per-agent plans.
 #[derive(Debug, Clone)]
 pub struct DaemonPlan {
     pub socket_dir: PathBuf,
     pub agents: Vec<AgentPlan>,
-    pub executor: Arc<dyn Executor>,
-}
-
-impl DaemonPlan {
-    /// Swap the executor without re-running `prepare`. Useful in tests that
-    /// want to reuse a built plan with a different implementation.
-    pub fn with_executor(mut self, executor: Arc<dyn Executor>) -> Self {
-        self.executor = executor;
-        self
-    }
 }
 
 /// Load every agent referenced by `daemon`, validate models against
@@ -86,7 +78,6 @@ pub fn prepare(
     daemon: &DaemonConfig,
     catalog: &ModelCatalog,
     registry: &dyn Registry,
-    executor: Arc<dyn Executor>,
 ) -> Result<DaemonPlan, DaemonPrepareError> {
     let mut agents = Vec::with_capacity(daemon.agent_paths.len());
 
@@ -105,6 +96,7 @@ pub fn prepare(
 
         let name = cfg.id.name.clone();
         let socket_path = socket_path_for(&daemon.socket_dir, &name);
+        let executor = crate::executor::executor_for(&cfg.model);
         let uuid = registry.insert(cfg).map_err(|source| match source {
             RegistryError::AlreadyExists(n) => DaemonPrepareError::DuplicateAgent(n),
             other => DaemonPrepareError::Registry {
@@ -123,13 +115,13 @@ pub fn prepare(
             uuid,
             config,
             socket_path,
+            executor,
         });
     }
 
     Ok(DaemonPlan {
         socket_dir: daemon.socket_dir.clone(),
         agents,
-        executor,
     })
 }
 
@@ -186,7 +178,6 @@ pub fn bind_plan(plan: DaemonPlan) -> Result<BoundDaemon, DaemonBindError> {
     let DaemonPlan {
         socket_dir,
         agents: plan_agents,
-        executor,
     } = plan;
 
     std::fs::create_dir_all(&socket_dir).map_err(|source| DaemonBindError::CreateSocketDir {
@@ -210,7 +201,7 @@ pub fn bind_plan(plan: DaemonPlan) -> Result<BoundDaemon, DaemonBindError> {
         let harness = AgentHarness::bind(
             (*agent.config).clone(),
             agent.socket_path.clone(),
-            Some(executor.clone()),
+            Some(agent.executor.clone()),
         )
         .map_err(|source| DaemonBindError::Bind {
             path: agent.socket_path.clone(),
@@ -320,7 +311,7 @@ mod tests {
         let registry = InMemoryRegistry::default();
 
         let plan =
-            prepare(&daemon, &catalog, &registry, stub_executor()).expect("prepare succeeds");
+            prepare(&daemon, &catalog, &registry).expect("prepare succeeds");
 
         assert_eq!(plan.socket_dir, socket_dir);
         assert_eq!(plan.agents.len(), 2);
@@ -356,7 +347,7 @@ mod tests {
         let catalog = ModelCatalog::with_builtin();
         let registry = InMemoryRegistry::default();
 
-        let err = prepare(&daemon, &catalog, &registry, stub_executor()).unwrap_err();
+        let err = prepare(&daemon, &catalog, &registry).unwrap_err();
         assert!(
             matches!(err, DaemonPrepareError::UnknownModel { ref agent, .. } if agent == "ghost"),
             "unexpected error: {err:?}"
@@ -382,7 +373,7 @@ mod tests {
         let catalog = ModelCatalog::with_builtin();
         let registry = InMemoryRegistry::default();
 
-        let err = prepare(&daemon, &catalog, &registry, stub_executor()).unwrap_err();
+        let err = prepare(&daemon, &catalog, &registry).unwrap_err();
         assert!(
             matches!(err, DaemonPrepareError::DuplicateAgent(ref name) if name == "barnaby"),
             "unexpected error: {err:?}"
@@ -397,7 +388,7 @@ mod tests {
         let catalog = ModelCatalog::with_builtin();
         let registry = InMemoryRegistry::default();
 
-        let err = prepare(&daemon, &catalog, &registry, stub_executor()).unwrap_err();
+        let err = prepare(&daemon, &catalog, &registry).unwrap_err();
         assert!(
             matches!(err, DaemonPrepareError::AgentConfig { ref path, .. } if path == &missing),
             "unexpected error: {err:?}"
@@ -418,7 +409,7 @@ mod tests {
         let catalog = ModelCatalog::with_builtin();
         let registry = InMemoryRegistry::default();
         let plan =
-            prepare(&daemon, &catalog, &registry, stub_executor()).expect("prepare succeeds");
+            prepare(&daemon, &catalog, &registry).expect("prepare succeeds");
         (plan, registry)
     }
 
@@ -489,7 +480,10 @@ mod tests {
     async fn bind_plan_dispatches_message_through_stub_executor() {
         let tmp = TempDir::new().unwrap();
         let socket_dir = tmp.path().join("sockets");
-        let (plan, _registry) = plan_with_one_agent(&tmp, socket_dir.clone(), "barnaby");
+        let (mut plan, _registry) = plan_with_one_agent(&tmp, socket_dir.clone(), "barnaby");
+        // Force the stub so this test is independent of what `executor_for`
+        // returns for the agent's configured provider.
+        plan.agents[0].executor = stub_executor();
         let bound = bind_plan(plan).expect("bind_plan succeeds");
 
         let (mut set, _) = bound.spawn_all();

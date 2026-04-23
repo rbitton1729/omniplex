@@ -26,6 +26,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::bus::{PeerMessage, PeerReply};
 use crate::executor::{ExecutionContext, Executor};
+use crate::memory::MemoryService;
 use crate::types::{AgentConfig, BudgetSnapshot, DeferCondition, Deliberation};
 
 #[derive(Debug, Error)]
@@ -42,6 +43,7 @@ pub struct AgentHarness {
     socket_path: PathBuf,
     started: Instant,
     executor: Option<Arc<dyn Executor>>,
+    memory: Option<Arc<dyn MemoryService>>,
 }
 
 impl AgentHarness {
@@ -52,10 +54,13 @@ impl AgentHarness {
     ///
     /// `executor` is optional so tests and minimal harness fixtures can run
     /// without one; production callers should always pass `Some(...)`.
+    /// `memory` is also optional — production callers wire a per-agent
+    /// `LanternMemory`; tests that don't exercise recall pass `None`.
     pub fn bind(
         config: AgentConfig,
         socket_path: PathBuf,
         executor: Option<Arc<dyn Executor>>,
+        memory: Option<Arc<dyn MemoryService>>,
     ) -> Result<Self, HarnessError> {
         let listener = UnixListener::bind(&socket_path)?;
         Ok(Self {
@@ -64,6 +69,7 @@ impl AgentHarness {
             socket_path,
             started: Instant::now(),
             executor,
+            memory,
         })
     }
 
@@ -84,10 +90,11 @@ impl AgentHarness {
             let (stream, _addr) = self.listener.accept().await?;
             let cfg = self.config.clone();
             let executor = self.executor.clone();
+            let memory = self.memory.clone();
             let started = self.started;
             let name = agent_name.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(cfg, executor, started, stream).await {
+                if let Err(e) = handle_connection(cfg, executor, memory, started, stream).await {
                     eprintln!("harness[{name}]: connection error: {e}");
                 }
             });
@@ -107,6 +114,7 @@ impl Drop for AgentHarness {
 async fn handle_connection(
     cfg: Arc<AgentConfig>,
     executor: Option<Arc<dyn Executor>>,
+    memory: Option<Arc<dyn MemoryService>>,
     started: Instant,
     stream: UnixStream,
 ) -> Result<(), HarnessError> {
@@ -118,7 +126,7 @@ async fn handle_connection(
     }
 
     let reply = match serde_json::from_str::<PeerMessage>(line.trim_end()) {
-        Ok(msg) => route(&cfg, executor.as_ref(), started, msg).await,
+        Ok(msg) => route(&cfg, executor.as_ref(), memory.as_ref(), started, msg).await,
         Err(e) => PeerReply::Error {
             reason: format!("invalid peer message: {e}"),
         },
@@ -134,6 +142,7 @@ async fn handle_connection(
 async fn route(
     cfg: &Arc<AgentConfig>,
     executor: Option<&Arc<dyn Executor>>,
+    memory: Option<&Arc<dyn MemoryService>>,
     started: Instant,
     msg: PeerMessage,
 ) -> PeerReply {
@@ -146,13 +155,14 @@ async fn route(
         },
         msg @ (PeerMessage::Message { .. }
         | PeerMessage::Delegate { .. }
-        | PeerMessage::Event { .. }) => deliberate(cfg, executor, msg).await,
+        | PeerMessage::Event { .. }) => deliberate(cfg, executor, memory, msg).await,
     }
 }
 
 async fn deliberate(
     cfg: &Arc<AgentConfig>,
     executor: Option<&Arc<dyn Executor>>,
+    memory: Option<&Arc<dyn MemoryService>>,
     msg: PeerMessage,
 ) -> PeerReply {
     let Some(exec) = executor else {
@@ -167,7 +177,7 @@ async fn deliberate(
         config: cfg.clone(),
         message: msg,
         budget,
-        memory: None,
+        memory: memory.cloned(),
     };
 
     match exec.deliberate(ctx).await {
@@ -230,14 +240,21 @@ mod tests {
 
     #[tokio::test]
     async fn route_ping_returns_ack() {
-        let reply = route(&cfg(), None, Instant::now(), PeerMessage::Ping).await;
+        let reply = route(&cfg(), None, None, Instant::now(), PeerMessage::Ping).await;
         assert!(matches!(reply, PeerReply::Ack));
     }
 
     #[tokio::test]
     async fn route_status_returns_status_without_invoking_executor() {
         let exec: Arc<dyn Executor> = Arc::new(StubExecutor);
-        let reply = route(&cfg(), Some(&exec), Instant::now(), PeerMessage::Status).await;
+        let reply = route(
+            &cfg(),
+            Some(&exec),
+            None,
+            Instant::now(),
+            PeerMessage::Status,
+        )
+        .await;
         match reply {
             PeerReply::Status { agent, .. } => assert_eq!(agent.name, "barnaby"),
             other => panic!("expected Status, got {other:?}"),
@@ -246,7 +263,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_message_without_executor_defers_with_stock_reasoning() {
-        let reply = route(&cfg(), None, Instant::now(), message()).await;
+        let reply = route(&cfg(), None, None, Instant::now(), message()).await;
         match reply {
             PeerReply::Deliberation(Deliberation::Defer { until, reasoning }) => {
                 assert!(matches!(until, DeferCondition::Never));
@@ -262,7 +279,7 @@ mod tests {
     #[tokio::test]
     async fn route_message_with_stub_executor_defers_via_executor() {
         let exec: Arc<dyn Executor> = Arc::new(StubExecutor);
-        let reply = route(&cfg(), Some(&exec), Instant::now(), message()).await;
+        let reply = route(&cfg(), Some(&exec), None, Instant::now(), message()).await;
         match reply {
             PeerReply::Deliberation(Deliberation::Defer { until, reasoning }) => {
                 assert!(matches!(until, DeferCondition::Never));

@@ -7,12 +7,14 @@ use crate::types::AgentConfig;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonConfig {
     pub socket_dir: PathBuf,
+    pub data_dir: PathBuf,
     pub agent_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawDaemonConfig {
     socket_dir: PathBuf,
+    data_dir: PathBuf,
     #[serde(default)]
     agents: Vec<PathBuf>,
 }
@@ -30,6 +32,7 @@ impl DaemonConfig {
     fn from_raw(base_dir: &Path, raw: RawDaemonConfig) -> Self {
         Self {
             socket_dir: resolve_path(base_dir, raw.socket_dir),
+            data_dir: resolve_path(base_dir, raw.data_dir),
             agent_paths: raw
                 .agents
                 .into_iter()
@@ -83,6 +86,7 @@ mod tests {
             &daemon_path,
             r#"
 socket_dir = "../run/sockets"
+data_dir = "../run/agents"
 agents = ["agents/barnaby.toml"]
 "#,
         )
@@ -91,6 +95,7 @@ agents = ["agents/barnaby.toml"]
         let cfg = DaemonConfig::load_from_file(&daemon_path).unwrap();
 
         assert_eq!(cfg.socket_dir, tmp.path().join("run/sockets"));
+        assert_eq!(cfg.data_dir, tmp.path().join("run/agents"));
         assert_eq!(cfg.agent_paths, vec![conf_dir.join("agents/barnaby.toml")]);
     }
 
@@ -99,12 +104,14 @@ agents = ["agents/barnaby.toml"]
         let tmp = TempDir::new().unwrap();
         let daemon_path = tmp.path().join("daemon.toml");
         let socket_dir = tmp.path().join("sockets");
+        let data_dir = tmp.path().join("data");
         let agent_path = tmp.path().join("agents/barnaby.toml");
         std::fs::write(
             &daemon_path,
             format!(
-                "socket_dir = {:?}\nagents = [{:?}]\n",
+                "socket_dir = {:?}\ndata_dir = {:?}\nagents = [{:?}]\n",
                 socket_dir.to_string_lossy(),
+                data_dir.to_string_lossy(),
                 agent_path.to_string_lossy()
             ),
         )
@@ -113,6 +120,7 @@ agents = ["agents/barnaby.toml"]
         let cfg = DaemonConfig::load_from_file(&daemon_path).unwrap();
 
         assert_eq!(cfg.socket_dir, socket_dir);
+        assert_eq!(cfg.data_dir, data_dir);
         assert_eq!(cfg.agent_paths, vec![agent_path]);
     }
 }

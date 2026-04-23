@@ -27,6 +27,7 @@ use crate::catalog::{CatalogError, ModelCatalog};
 use crate::config::{DaemonConfig, load_agent_config};
 use crate::executor::Executor;
 use crate::harness::{AgentHarness, HarnessError};
+use crate::memory::{LanternMemory, MemoryError, MemoryService};
 use crate::types::{AgentConfig, Registry, RegistryError};
 
 #[derive(Debug, Error)]
@@ -53,7 +54,8 @@ pub enum DaemonPrepareError {
 }
 
 /// One agent's prepared state: its registry-canonical config, its UUID,
-/// the socket path it should bind, and the executor it will dispatch
+/// the socket path it should bind, the on-disk directory holding its
+/// per-agent state (Lantern store, etc.), and the executor it will dispatch
 /// through. Per-agent so a daemon can mix providers (e.g., one Ollama
 /// agent alongside one Anthropic agent).
 #[derive(Debug, Clone)]
@@ -61,6 +63,7 @@ pub struct AgentPlan {
     pub uuid: Uuid,
     pub config: Arc<AgentConfig>,
     pub socket_path: PathBuf,
+    pub data_path: PathBuf,
     pub executor: Arc<dyn Executor>,
 }
 
@@ -96,6 +99,7 @@ pub fn prepare(
 
         let name = cfg.id.name.clone();
         let socket_path = socket_path_for(&daemon.socket_dir, &name);
+        let data_path = daemon.data_dir.join(&name);
         let executor = crate::executor::executor_for(&cfg.model);
         let uuid = registry.insert(cfg).map_err(|source| match source {
             RegistryError::AlreadyExists(n) => DaemonPrepareError::DuplicateAgent(n),
@@ -115,6 +119,7 @@ pub fn prepare(
             uuid,
             config,
             socket_path,
+            data_path,
             executor,
         });
     }
@@ -138,6 +143,18 @@ pub enum DaemonBindError {
         path: PathBuf,
         #[source]
         source: io::Error,
+    },
+    #[error("failed to create agent data dir {path}: {source}")]
+    CreateDataDir {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to spawn memory for agent at {path}: {source}")]
+    SpawnMemory {
+        path: PathBuf,
+        #[source]
+        source: MemoryError,
     },
     #[error("failed to bind {path}: {source}")]
     Bind {
@@ -198,10 +215,26 @@ pub fn bind_plan(plan: DaemonPlan) -> Result<BoundDaemon, DaemonBindError> {
             })?;
         }
 
+        std::fs::create_dir_all(&agent.data_path).map_err(|source| {
+            DaemonBindError::CreateDataDir {
+                path: agent.data_path.clone(),
+                source,
+            }
+        })?;
+        let memory: Arc<dyn MemoryService> = Arc::new(
+            LanternMemory::spawn(&agent.data_path).map_err(|source| {
+                DaemonBindError::SpawnMemory {
+                    path: agent.data_path.clone(),
+                    source,
+                }
+            })?,
+        );
+
         let harness = AgentHarness::bind(
             (*agent.config).clone(),
             agent.socket_path.clone(),
             Some(agent.executor.clone()),
+            Some(memory),
         )
         .map_err(|source| DaemonBindError::Bind {
             path: agent.socket_path.clone(),
@@ -286,8 +319,13 @@ mod tests {
     }
 
     fn daemon_with_agents(socket_dir: PathBuf, agent_paths: Vec<PathBuf>) -> DaemonConfig {
+        let data_dir = socket_dir
+            .parent()
+            .map(|p| p.join("agents"))
+            .unwrap_or_else(|| PathBuf::from("agents"));
         DaemonConfig {
             socket_dir,
+            data_dir,
             agent_paths,
         }
     }

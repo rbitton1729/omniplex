@@ -144,7 +144,7 @@ impl Budget {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct BudgetSnapshot {
     pub remaining: Allocation,
     pub depth: u8,
@@ -436,7 +436,7 @@ pub enum CiStatus {
 // Deliberation
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub capability: CapabilityId,
     pub args: serde_json::Value,
@@ -448,7 +448,8 @@ pub struct Task {
 /// Phase 1 subset. `NeedMore` (model requests more context) lands in Phase 2
 /// with deliberative watches. Adding a variant is a breaking change for the
 /// executor's dispatch; do it once, intentionally.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Deliberation {
     Act {
         task: Task,
@@ -464,7 +465,8 @@ pub enum Deliberation {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DeferCondition {
     Time(Timestamp),
     Event(EventFilter),
@@ -474,7 +476,7 @@ pub enum DeferCondition {
     Never,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventFilter(pub String);
 
 // ---------------------------------------------------------------------------

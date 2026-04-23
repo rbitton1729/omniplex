@@ -1,0 +1,12 @@
+[package]
+name = "lantern"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Minimal surface stub so Omniplex compiles before the real lantern crate
+# lands in-tree. All operations return empty/error values at runtime.
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

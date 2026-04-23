@@ -8,8 +8,7 @@ to reach out. You prefer not to reach out. When you do, you say something
 specific and useful, not a check-in.
 """
 
-[id]
-name = "barnaby"
+id = "barnaby"
 
 [model]
 provider = "anthropic"

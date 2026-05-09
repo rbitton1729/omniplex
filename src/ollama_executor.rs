@@ -18,7 +18,8 @@
 //! Out of scope for Phase 1:
 //!   - Token accounting against `ctx.budget` (Phase 2 — wiring the
 //!     `prompt_eval_count` / `eval_count` fields into a Reservation).
-//!   - Memory recall (Phase 2 — `ctx.memory` is ignored).
+//!   - Structured `Act` / `Defer` / `Abandon` parsing (Phase 2 — current
+//!     contract still treats successful model output as defer reasoning).
 //!   - History compaction / truncation (the vec grows unbounded for now).
 
 use std::sync::Arc;
@@ -54,6 +55,7 @@ impl OllamaExecutor {
 impl Executor for OllamaExecutor {
     async fn deliberate(&self, ctx: ExecutionContext) -> Result<Deliberation, ExecutorError> {
         let user_message = render_user_message(&ctx.message)?;
+        let user_message = augment_with_recall(&ctx, user_message).await;
 
         let mut history = self.history.lock().await;
         let mut messages = Vec::with_capacity(history.len() + 2);
@@ -69,6 +71,31 @@ impl Executor for OllamaExecutor {
             .await
             .map_err(map_ollama_error)?;
 
+        if let Some(memory) = &ctx.memory {
+            let turn = crate::memory::ActivityTurn {
+                goal_id: uuid::Uuid::new_v4(),
+                turn_id: uuid::Uuid::new_v4(),
+                entries: vec![
+                    crate::memory::TurnEntry {
+                        role: "user".into(),
+                        content: user_message.clone(),
+                        timestamp: chrono::Utc::now(),
+                        tool_name: None,
+                    },
+                    crate::memory::TurnEntry {
+                        role: "assistant".into(),
+                        content: response.clone(),
+                        timestamp: chrono::Utc::now(),
+                        tool_name: None,
+                    },
+                ],
+            };
+            memory
+                .record_turn(&ctx.config.id, turn)
+                .await
+                .map_err(|e| ExecutorError::Internal(format!("record turn: {e}")))?;
+        }
+
         history.push(ChatMessage::new("user", user_message));
         history.push(ChatMessage::new("assistant", response.clone()));
 
@@ -77,6 +104,30 @@ impl Executor for OllamaExecutor {
             reasoning: response,
         })
     }
+}
+
+async fn augment_with_recall(ctx: &ExecutionContext, user_message: String) -> String {
+    let Some(memory) = &ctx.memory else {
+        return user_message;
+    };
+
+    let mut opts = crate::memory::SearchOpts::default();
+    opts.limit = 3;
+
+    let Ok(hits) = memory.recall(&ctx.config.id, &user_message, opts).await else {
+        return user_message;
+    };
+    if hits.is_empty() {
+        return user_message;
+    }
+
+    let context_lines = hits
+        .into_iter()
+        .map(|hit| format!("- {}", hit.snippet.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!("User message:\n{user_message}\n\nRelevant prior context:\n{context_lines}")
 }
 
 fn render_user_message(msg: &PeerMessage) -> Result<String, ExecutorError> {
@@ -130,17 +181,91 @@ fn map_ollama_error(err: OllamaError) -> ExecutorError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
+    use async_trait::async_trait;
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::bus::PeerOrigin;
+    use crate::memory::{Hit, MemoryError, MemoryService, SearchOpts};
     use crate::types::{
         AgentConfig, AgentId, Allocation, BudgetPolicy, BudgetSnapshot, CommitPolicy, MemoryScope,
         ModelProvider, ModelRef,
     };
+
+    #[derive(Debug)]
+    struct StaticMemory {
+        hits: Vec<Hit>,
+    }
+
+    #[async_trait]
+    impl MemoryService for StaticMemory {
+        async fn record_turn(
+            &self,
+            _agent: &AgentId,
+            _turn: crate::memory::ActivityTurn,
+        ) -> Result<(), MemoryError> {
+            Ok(())
+        }
+
+        async fn search(
+            &self,
+            _agent: &AgentId,
+            _query: &str,
+            _opts: SearchOpts,
+        ) -> Result<Vec<Hit>, MemoryError> {
+            Ok(self.hits.clone())
+        }
+
+        async fn recall(
+            &self,
+            _agent: &AgentId,
+            _context: &str,
+            _opts: SearchOpts,
+        ) -> Result<Vec<Hit>, MemoryError> {
+            Ok(self.hits.clone())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingMemory {
+        turns: Mutex<Vec<crate::memory::ActivityTurn>>,
+    }
+
+    #[async_trait]
+    impl MemoryService for RecordingMemory {
+        async fn record_turn(
+            &self,
+            _agent: &AgentId,
+            turn: crate::memory::ActivityTurn,
+        ) -> Result<(), MemoryError> {
+            self.turns
+                .lock()
+                .expect("recording memory poisoned")
+                .push(turn);
+            Ok(())
+        }
+
+        async fn search(
+            &self,
+            _agent: &AgentId,
+            _query: &str,
+            _opts: SearchOpts,
+        ) -> Result<Vec<Hit>, MemoryError> {
+            Ok(Vec::new())
+        }
+
+        async fn recall(
+            &self,
+            _agent: &AgentId,
+            _context: &str,
+            _opts: SearchOpts,
+        ) -> Result<Vec<Hit>, MemoryError> {
+            Ok(Vec::new())
+        }
+    }
 
     fn agent_config(system_prompt: &str) -> Arc<AgentConfig> {
         Arc::new(AgentConfig {
@@ -281,6 +406,127 @@ mod tests {
             Deliberation::Defer { reasoning, .. } => assert_eq!(reasoning, "yes"),
             other => panic!("expected Defer, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn deliberate_includes_recalled_context_in_user_prompt() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_json(serde_json::json!({
+                "model": "llama3:8b",
+                "messages": [
+                    {"role": "user", "content": "User message:\nwhat happened with pipeline seven?\n\nRelevant prior context:\n- Three CI failures on pipeline seven in the last hour."}
+                ],
+                "stream": false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "llama3:8b",
+                "created_at": "2024-01-01T00:00:00Z",
+                "message": {"role": "assistant", "content": "I found the prior failures."},
+                "done": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let exec = OllamaExecutor::new(OllamaChatClient::new(server.uri()));
+        let ctx = ExecutionContext {
+            config: agent_config(""),
+            message: PeerMessage::Message {
+                from: PeerOrigin::External {
+                    label: "test".into(),
+                },
+                text: "what happened with pipeline seven?".into(),
+                sent_at: chrono::Utc::now(),
+            },
+            budget: BudgetSnapshot {
+                remaining: Allocation::zero(),
+                depth: 0,
+                max_depth: 3,
+            },
+            memory: Some(Arc::new(StaticMemory {
+                hits: vec![Hit {
+                    uri: "agent://barnaby/goal/g/turn/t".into(),
+                    ordinal: 0,
+                    text: "Three CI failures on pipeline seven in the last hour.".into(),
+                    snippet: "Three CI failures on pipeline seven in the last hour.".into(),
+                    score: 1.0,
+                    role: Some("note".into()),
+                    session_id: None,
+                    turn_id: None,
+                }],
+            })),
+        };
+
+        let got = exec.deliberate(ctx).await.unwrap();
+        match got {
+            Deliberation::Defer { until, reasoning } => {
+                assert!(matches!(until, DeferCondition::Never));
+                assert_eq!(reasoning, "I found the prior failures.");
+            }
+            other => panic!("expected Defer, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deliberate_records_turn_when_memory_is_available() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "llama3:8b",
+                "created_at": "2024-01-01T00:00:00Z",
+                "message": {"role": "assistant", "content": "I found the prior failures."},
+                "done": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let exec = OllamaExecutor::new(OllamaChatClient::new(server.uri()));
+        let memory = Arc::new(RecordingMemory::default());
+        let ctx = ExecutionContext {
+            config: agent_config(""),
+            message: PeerMessage::Message {
+                from: PeerOrigin::External {
+                    label: "test".into(),
+                },
+                text: "what happened with pipeline seven?".into(),
+                sent_at: chrono::Utc::now(),
+            },
+            budget: BudgetSnapshot {
+                remaining: Allocation::zero(),
+                depth: 0,
+                max_depth: 3,
+            },
+            memory: Some(memory.clone()),
+        };
+
+        let got = exec.deliberate(ctx).await.unwrap();
+        match got {
+            Deliberation::Defer { until, reasoning } => {
+                assert!(matches!(until, DeferCondition::Never));
+                assert_eq!(reasoning, "I found the prior failures.");
+            }
+            other => panic!("expected Defer, got {other:?}"),
+        }
+
+        let turns = memory.turns.lock().expect("recording memory poisoned");
+        assert_eq!(turns.len(), 1, "executor should persist one turn");
+        assert_eq!(
+            turns[0].entries.len(),
+            2,
+            "turn should capture request and reply"
+        );
+        assert_eq!(turns[0].entries[0].role, "user");
+        assert!(
+            turns[0].entries[0]
+                .content
+                .contains("what happened with pipeline seven?")
+        );
+        assert_eq!(turns[0].entries[1].role, "assistant");
+        assert_eq!(turns[0].entries[1].content, "I found the prior failures.");
     }
 
     #[tokio::test]

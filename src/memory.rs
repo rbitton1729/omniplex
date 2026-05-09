@@ -303,6 +303,8 @@ fn do_search(
             limit: opts.limit,
             kind: None,
             path_contains: None,
+            session_id: None,
+            min_confidence: None,
         },
     )
     .map_err(|e| MemoryError::Lantern(e.to_string()))?;

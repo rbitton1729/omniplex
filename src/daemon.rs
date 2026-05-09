@@ -221,14 +221,13 @@ pub fn bind_plan(plan: DaemonPlan) -> Result<BoundDaemon, DaemonBindError> {
                 source,
             }
         })?;
-        let memory: Arc<dyn MemoryService> = Arc::new(
-            LanternMemory::spawn(&agent.data_path).map_err(|source| {
+        let memory: Arc<dyn MemoryService> =
+            Arc::new(LanternMemory::spawn(&agent.data_path).map_err(|source| {
                 DaemonBindError::SpawnMemory {
                     path: agent.data_path.clone(),
                     source,
                 }
-            })?,
-        );
+            })?);
 
         let harness = AgentHarness::bind(
             (*agent.config).clone(),
@@ -348,8 +347,7 @@ mod tests {
         let catalog = ModelCatalog::with_builtin();
         let registry = InMemoryRegistry::default();
 
-        let plan =
-            prepare(&daemon, &catalog, &registry).expect("prepare succeeds");
+        let plan = prepare(&daemon, &catalog, &registry).expect("prepare succeeds");
 
         assert_eq!(plan.socket_dir, socket_dir);
         assert_eq!(plan.agents.len(), 2);
@@ -446,8 +444,7 @@ mod tests {
         let daemon = daemon_with_agents(socket_dir, vec![agent_file]);
         let catalog = ModelCatalog::with_builtin();
         let registry = InMemoryRegistry::default();
-        let plan =
-            prepare(&daemon, &catalog, &registry).expect("prepare succeeds");
+        let plan = prepare(&daemon, &catalog, &registry).expect("prepare succeeds");
         (plan, registry)
     }
 

@@ -16,9 +16,9 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", 
 toml = "0.8"
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
-# TODO: Lantern integration. Using an in-tree stub at stubs/lantern/ until the
-# real crate is vendored (submodule, workspace member, or git dep).
-lantern = { path = "stubs/lantern" }
+# Real Lantern integration via the sibling checkout. Keep the runtime-facing
+# seam in `src/memory.rs`; Cargo just points the crate graph at the real store.
+lantern = { path = "../lantern" }
 
 [dev-dependencies]
 tempfile = "3"

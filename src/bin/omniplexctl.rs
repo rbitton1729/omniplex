@@ -127,10 +127,7 @@ async fn run_send(
     Ok(())
 }
 
-async fn run_status(
-    config_path: &PathBuf,
-    agent: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_status(config_path: &PathBuf, agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     let daemon = DaemonConfig::load_from_file(config_path)?;
     let reply = send_one(&daemon.socket_dir, agent, &PeerMessage::Status).await?;
     println!("{}", serde_json::to_string_pretty(&reply)?);

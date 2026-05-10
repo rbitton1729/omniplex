@@ -1,25 +1,25 @@
 //! Executor backed by [`OllamaChatClient`].
 //!
-//! Phase 1 contract: every successful model response is wrapped as
-//! `Deliberation::Defer { until: Never, reasoning: response_text }`. The
-//! executor does not yet parse `Act`/`Defer`/`Abandon` out of structured
-//! model output — that lands once we settle on a prompt format. Until then,
-//! the model's free-form reply is the deliberation's reasoning, which is
-//! exactly what a human-facing `Message` flow needs (the harness returns it
-//! in `PeerReply::Deliberation`).
+//! Contract: the model is asked to reply with a single JSON object that
+//! deserializes into [`Deliberation`] (`Act` / `Defer` / `Abandon`). The
+//! prompt addendum in [`FORMAT_CONTRACT`] pins the schema, and the executor
+//! parses the reply with `serde_json`. A reply that fails to parse surfaces
+//! as `ExecutorError::InvalidResponse` — the executor never silently rewrites
+//! malformed output as a Defer.
 //!
 //! Multi-turn history is held per-executor in an `Arc<Mutex<Vec<ChatMessage>>>`.
-//! Each `deliberate` call prepends the system prompt, appends the accumulated
-//! history, then the new user turn; on success both the user message and the
-//! assistant reply are appended to history. The mutex is held across the
-//! HTTP call, so concurrent deliberations on the same executor serialize —
-//! that matches the single accept-loop-per-agent harness model.
+//! Each `deliberate` call prepends the system prompt (user prompt joined with
+//! [`FORMAT_CONTRACT`]), appends the accumulated history, then the new user
+//! turn; on success both the user message and the raw assistant JSON are
+//! appended to history so the model sees its prior structured replies. The
+//! mutex is held across the HTTP call, so concurrent deliberations on the
+//! same executor serialize — that matches the single accept-loop-per-agent
+//! harness model. Failed turns (HTTP error or malformed reply) do not mutate
+//! history.
 //!
-//! Out of scope for Phase 1:
+//! Out of scope here:
 //!   - Token accounting against `ctx.budget` (Phase 2 — wiring the
 //!     `prompt_eval_count` / `eval_count` fields into a Reservation).
-//!   - Structured `Act` / `Defer` / `Abandon` parsing (Phase 2 — current
-//!     contract still treats successful model output as defer reasoning).
 //!   - History compaction / truncation (the vec grows unbounded for now).
 
 use std::sync::Arc;
@@ -30,7 +30,24 @@ use tokio::sync::Mutex;
 use crate::bus::{EventPayload, PeerMessage};
 use crate::executor::{ExecutionContext, Executor, ExecutorError};
 use crate::ollama::{ChatMessage, OllamaChatClient, OllamaError};
-use crate::types::{DeferCondition, Deliberation};
+use crate::types::Deliberation;
+
+/// Strict response contract appended to the agent's system prompt. The model
+/// must reply with a single JSON object that round-trips through
+/// `serde_json::from_str::<Deliberation>` — anything else surfaces as
+/// [`ExecutorError::InvalidResponse`].
+pub(crate) const FORMAT_CONTRACT: &str = r#"Reply with EXACTLY one JSON object that matches one of the following schemas. Output only the JSON — no Markdown, no prose, no code fences.
+
+1) Call a capability:
+   {"kind":"act","task":{"capability":"<id>","args":{...},"idempotency_key":"<unique-string>"},"reasoning":"<why>","next_check":"never"}
+
+2) Wait without acting:
+   {"kind":"defer","until":"never","reasoning":"<why>"}
+
+3) Give up:
+   {"kind":"abandon","reasoning":"<why>"}
+
+For "until" or "next_check" you may use the string "never", or {"time":"<RFC3339 timestamp>"}, or {"event":"<filter>"}."#;
 
 #[derive(Debug, Clone)]
 pub struct OllamaExecutor {
@@ -59,9 +76,10 @@ impl Executor for OllamaExecutor {
 
         let mut history = self.history.lock().await;
         let mut messages = Vec::with_capacity(history.len() + 2);
-        if !ctx.config.system_prompt.is_empty() {
-            messages.push(ChatMessage::new("system", ctx.config.system_prompt.clone()));
-        }
+        messages.push(ChatMessage::new(
+            "system",
+            build_system_prompt(&ctx.config.system_prompt),
+        ));
         messages.extend(history.iter().cloned());
         messages.push(ChatMessage::new("user", user_message.clone()));
 
@@ -70,6 +88,8 @@ impl Executor for OllamaExecutor {
             .chat_messages(&ctx.config.model.model, messages)
             .await
             .map_err(map_ollama_error)?;
+
+        let deliberation = parse_deliberation(&response)?;
 
         if let Some(memory) = &ctx.memory {
             let turn = crate::memory::ActivityTurn {
@@ -97,13 +117,26 @@ impl Executor for OllamaExecutor {
         }
 
         history.push(ChatMessage::new("user", user_message));
-        history.push(ChatMessage::new("assistant", response.clone()));
+        history.push(ChatMessage::new("assistant", response));
 
-        Ok(Deliberation::Defer {
-            until: DeferCondition::Never,
-            reasoning: response,
-        })
+        Ok(deliberation)
     }
+}
+
+fn build_system_prompt(user_prompt: &str) -> String {
+    if user_prompt.is_empty() {
+        FORMAT_CONTRACT.to_string()
+    } else {
+        format!("{user_prompt}\n\n{FORMAT_CONTRACT}")
+    }
+}
+
+fn parse_deliberation(raw: &str) -> Result<Deliberation, ExecutorError> {
+    serde_json::from_str::<Deliberation>(raw.trim()).map_err(|e| {
+        ExecutorError::InvalidResponse(format!(
+            "model output was not a Deliberation JSON object: {e}; raw={raw:?}"
+        ))
+    })
 }
 
 async fn augment_with_recall(ctx: &ExecutionContext, user_message: String) -> String {
@@ -191,9 +224,41 @@ mod tests {
     use crate::bus::PeerOrigin;
     use crate::memory::{Hit, MemoryError, MemoryService, SearchOpts};
     use crate::types::{
-        AgentConfig, AgentId, Allocation, BudgetPolicy, BudgetSnapshot, CommitPolicy, MemoryScope,
-        ModelProvider, ModelRef,
+        AgentConfig, AgentId, Allocation, BudgetPolicy, BudgetSnapshot, CapabilityId, CommitPolicy,
+        DeferCondition, MemoryScope, ModelProvider, ModelRef, Task,
     };
+
+    fn defer_json(reasoning: &str) -> String {
+        serde_json::to_string(&Deliberation::Defer {
+            until: DeferCondition::Never,
+            reasoning: reasoning.into(),
+        })
+        .expect("serialize defer")
+    }
+
+    fn abandon_json(reasoning: &str) -> String {
+        serde_json::to_string(&Deliberation::Abandon {
+            reasoning: reasoning.into(),
+        })
+        .expect("serialize abandon")
+    }
+
+    fn act_json(capability: &str, args: serde_json::Value, idempotency_key: &str) -> String {
+        serde_json::to_string(&Deliberation::Act {
+            task: Task {
+                capability: CapabilityId(capability.into()),
+                args,
+                idempotency_key: idempotency_key.into(),
+            },
+            reasoning: "let's do it".into(),
+            next_check: DeferCondition::Never,
+        })
+        .expect("serialize act")
+    }
+
+    fn rendered_system_prompt(user_prompt: &str) -> String {
+        super::build_system_prompt(user_prompt)
+    }
 
     #[derive(Debug)]
     struct StaticMemory {
@@ -307,14 +372,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliberate_message_returns_defer_with_response_text() {
+    async fn deliberate_parses_structured_defer() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "model": "llama3:8b",
                 "created_at": "2024-01-01T00:00:00Z",
-                "message": {"role": "assistant", "content": "I am Barnaby."},
+                "message": {"role": "assistant", "content": defer_json("I am Barnaby.")},
                 "done": true
             })))
             .mount(&server)
@@ -339,8 +404,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deliberate_parses_structured_abandon() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "llama3:8b",
+                "created_at": "2024-01-01T00:00:00Z",
+                "message": {"role": "assistant", "content": abandon_json("nothing more to do")},
+                "done": true
+            })))
+            .mount(&server)
+            .await;
+
+        let exec = OllamaExecutor::new(OllamaChatClient::new(server.uri()));
+        let got = exec
+            .deliberate(message_ctx(agent_config(""), "anything?"))
+            .await
+            .unwrap();
+
+        match got {
+            Deliberation::Abandon { reasoning } => assert_eq!(reasoning, "nothing more to do"),
+            other => panic!("expected Abandon, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deliberate_parses_structured_act() {
+        let server = MockServer::start().await;
+        let args = serde_json::json!({"to": "diogenes", "text": "ping"});
+        let body = act_json("send_message", args.clone(), "msg-123");
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "llama3:8b",
+                "created_at": "2024-01-01T00:00:00Z",
+                "message": {"role": "assistant", "content": body},
+                "done": true
+            })))
+            .mount(&server)
+            .await;
+
+        let exec = OllamaExecutor::new(OllamaChatClient::new(server.uri()));
+        let got = exec
+            .deliberate(message_ctx(agent_config(""), "say hi to diogenes"))
+            .await
+            .unwrap();
+
+        match got {
+            Deliberation::Act {
+                task,
+                reasoning,
+                next_check,
+            } => {
+                assert_eq!(task.capability.0, "send_message");
+                assert_eq!(task.args, args);
+                assert_eq!(task.idempotency_key, "msg-123");
+                assert_eq!(reasoning, "let's do it");
+                assert!(matches!(next_check, DeferCondition::Never));
+            }
+            other => panic!("expected Act, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deliberate_malformed_output_is_invalid_response() {
+        let server = MockServer::start().await;
+        let sys = rendered_system_prompt("");
+
+        // First turn: model returns plain text — must surface as InvalidResponse.
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_json(serde_json::json!({
+                "model": "llama3:8b",
+                "messages": [
+                    {"role": "system", "content": sys.clone()},
+                    {"role": "user", "content": "first"}
+                ],
+                "stream": false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "llama3:8b",
+                "created_at": "2024-01-01T00:00:00Z",
+                "message": {"role": "assistant", "content": "hello, I am not JSON"},
+                "done": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Second turn: history must NOT include the malformed reply — the
+        // request body matches an empty history with just the new user turn.
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_json(serde_json::json!({
+                "model": "llama3:8b",
+                "messages": [
+                    {"role": "system", "content": sys},
+                    {"role": "user", "content": "second"}
+                ],
+                "stream": false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "llama3:8b",
+                "created_at": "2024-01-01T00:00:00Z",
+                "message": {"role": "assistant", "content": defer_json("ok")},
+                "done": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let exec = OllamaExecutor::new(OllamaChatClient::new(server.uri()));
+        let cfg = agent_config("");
+        let err = exec
+            .deliberate(message_ctx(cfg.clone(), "first"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ExecutorError::InvalidResponse(_)),
+            "got {err:?}"
+        );
+        let _ = exec
+            .deliberate(message_ctx(cfg, "second"))
+            .await
+            .expect("second turn parses");
+    }
+
+    #[tokio::test]
     async fn deliberate_accumulates_history_across_turns() {
         let server = MockServer::start().await;
+        let sys = rendered_system_prompt("You are Barnaby.");
+        let first_reply = defer_json("hi there");
+        let second_reply = defer_json("yes");
 
         // First turn: system + user("hello").
         Mock::given(method("POST"))
@@ -348,7 +544,7 @@ mod tests {
             .and(body_json(serde_json::json!({
                 "model": "llama3:8b",
                 "messages": [
-                    {"role": "system", "content": "You are Barnaby."},
+                    {"role": "system", "content": sys.clone()},
                     {"role": "user", "content": "hello"}
                 ],
                 "stream": false
@@ -356,22 +552,23 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "model": "llama3:8b",
                 "created_at": "2024-01-01T00:00:00Z",
-                "message": {"role": "assistant", "content": "hi there"},
+                "message": {"role": "assistant", "content": first_reply.clone()},
                 "done": true
             })))
             .expect(1)
             .mount(&server)
             .await;
 
-        // Second turn: system + full prior history + new user("still there?").
+        // Second turn: system + full prior history (with the raw structured
+        // assistant JSON) + new user("still there?").
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .and(body_json(serde_json::json!({
                 "model": "llama3:8b",
                 "messages": [
-                    {"role": "system", "content": "You are Barnaby."},
+                    {"role": "system", "content": sys},
                     {"role": "user", "content": "hello"},
-                    {"role": "assistant", "content": "hi there"},
+                    {"role": "assistant", "content": first_reply},
                     {"role": "user", "content": "still there?"}
                 ],
                 "stream": false
@@ -379,7 +576,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "model": "llama3:8b",
                 "created_at": "2024-01-01T00:00:00Z",
-                "message": {"role": "assistant", "content": "yes"},
+                "message": {"role": "assistant", "content": second_reply},
                 "done": true
             })))
             .expect(1)
@@ -416,6 +613,7 @@ mod tests {
             .and(body_json(serde_json::json!({
                 "model": "llama3:8b",
                 "messages": [
+                    {"role": "system", "content": rendered_system_prompt("")},
                     {"role": "user", "content": "User message:\nwhat happened with pipeline seven?\n\nRelevant prior context:\n- Three CI failures on pipeline seven in the last hour."}
                 ],
                 "stream": false
@@ -423,7 +621,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "model": "llama3:8b",
                 "created_at": "2024-01-01T00:00:00Z",
-                "message": {"role": "assistant", "content": "I found the prior failures."},
+                "message": {"role": "assistant", "content": defer_json("I found the prior failures.")},
                 "done": true
             })))
             .expect(1)
@@ -472,12 +670,13 @@ mod tests {
     #[tokio::test]
     async fn deliberate_records_turn_when_memory_is_available() {
         let server = MockServer::start().await;
+        let reply = defer_json("I found the prior failures.");
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "model": "llama3:8b",
                 "created_at": "2024-01-01T00:00:00Z",
-                "message": {"role": "assistant", "content": "I found the prior failures."},
+                "message": {"role": "assistant", "content": reply.clone()},
                 "done": true
             })))
             .expect(1)
@@ -526,12 +725,13 @@ mod tests {
                 .contains("what happened with pipeline seven?")
         );
         assert_eq!(turns[0].entries[1].role, "assistant");
-        assert_eq!(turns[0].entries[1].content, "I found the prior failures.");
+        assert_eq!(turns[0].entries[1].content, reply);
     }
 
     #[tokio::test]
     async fn deliberate_failed_turn_does_not_poison_history() {
         let server = MockServer::start().await;
+        let sys = rendered_system_prompt("");
 
         // First call fails with 503 — history must NOT grow.
         Mock::given(method("POST"))
@@ -539,6 +739,7 @@ mod tests {
             .and(body_json(serde_json::json!({
                 "model": "llama3:8b",
                 "messages": [
+                    {"role": "system", "content": sys.clone()},
                     {"role": "user", "content": "first"}
                 ],
                 "stream": false
@@ -554,6 +755,7 @@ mod tests {
             .and(body_json(serde_json::json!({
                 "model": "llama3:8b",
                 "messages": [
+                    {"role": "system", "content": sys},
                     {"role": "user", "content": "second"}
                 ],
                 "stream": false
@@ -561,7 +763,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "model": "llama3:8b",
                 "created_at": "2024-01-01T00:00:00Z",
-                "message": {"role": "assistant", "content": "ok"},
+                "message": {"role": "assistant", "content": defer_json("ok")},
                 "done": true
             })))
             .expect(1)
